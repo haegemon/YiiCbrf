@@ -63,190 +63,156 @@
  *	Yii::app()->cbrf->getRates()
  * вернет с массивом курсов
  * 
- * @todo Протестировать + подумать над Exception
- * @todo Добавить какую-то функцию/переменную для CbrfOutOfDateException
+ * @todo Протестировать
  * @todo Написать readme!
  */
-class Cbrf
+class Cbrf extends CApplicationComponent
 {
+	const DEFAULT_SOURCE_URL = 'http://www.cbr.ru/scripts/XML_daily.asp';
+	const DATA_CACHE_ID = 'cbrf_rates';
+	
 	/**
-	 * Валюта по умолчанию для короткой записи
+	 * Default currency.
+	 *
 	 * @var string
 	 */
 	public $defaultCurrency = 'USD';
 	/**
-	 * URL источника
+	 * Rates source url.
+	 *
 	 * @var string
+	 * @see self::DEFAULT_SOURCE_URL
 	 */
-	public $sourceUrl = 'http://www.cbr.ru/scripts/XML_daily.asp';
+	public $sourceUrl = self::DEFAULT_SOURCE_URL;
 	/**
-	 * Использовать компонент в системе Yii::app()->{$cacheId}
-	 * @var string
+	 * Yii application component id.
+	 * Defaults use yii application "cache" component.
+	 * If no ICache component exists, return dummy cache.
+	 *
+	 * @var string|null
 	 */
-	public $cahceId = 'cache';
+	public $cacheId;
+
+	private $rates = array();
+	private $cache;
+	
 	/**
-	 * Класс кэша по умоланию, если не используется стандартный компонент в системе
-	 * @var string
-	 */
-	public $cacheClass = 'CFileCache';
-	/**
-	 * Дата в формате date() при наступлении которой кэш устаревает
-	 * @var string
-	 */
-	public $cacheDateString = 'Ymd';
-	/**
-	 * Генерировать CbrfOutOfDateException или по возможности брать предыдущие значения
-	 * @var unknown_type
-	 */
-	public $generateCbrfOutOfDateException = false;
-	/**
-	 * Системный массив с валютами в формате [currencyCode] => value
-	 * @var array
-	 */
-	private $_currencyArray = array();
-	/**
-	 * Класс отвечающий за кэш, реализующий ICahche
-	 * @var ICache $cache
-	 */
-	private $_cache;
-	/**
-	 * Получить стоимость валюты относительно 1 рубля
+	 * Получить стоимость валюты относительно 1 рубля.
+	 *
 	 * @param string $currency
+	 * @throws CbrfCurrencyException При попытке передать неизвестную валюту.
 	 * @return float
 	 */
 	public function getRate($currency)
 	{
-		if (isset($this->_currencyArray[$currency])) {
-			return $this->_currencyArray[$currency];	
-		} else {
-			throw new CbrfException('Uknown currency ' . $currency);
-		}
+		if (isset($this->rates[$currency]))
+			return $this->rates[$currency];
+		else
+			throw new CbrfCurrencyException('Uknown currency ' . $currency);
 	}
 	/**
-	 * Получить значение в нужной валюте относительно рубля
+	 * Получить значение в нужной валюте относительно рубля.
+	 * 
 	 * @param float $value Число в валюте
-	 * @param string $currency Буквенный код валюты
+	 * @param string $currency Буквенный код валюты. По умолчанию берется дефолтная валюта из настроек.
+	 * @throws CbrfCurrencyException При попытке передать неизвестную валюту.
 	 * @return float
 	 */
-	public function getValue($value, $currency = false)
+	public function getValue($value, $currency = null)
 	{
 		if (!$currency) $currency = $this->defaultCurrency;
 		return $value * $this->getRate($currency);
 	}
+	
 	/**
-	 * Получить список всех котировок
+	 * Получить список всех котировок в формате [currencyCode] => (float)value
+	 * 
 	 * @return array
 	 */
 	public function getRates()
 	{
-		return $this->_currencyArray;
+		return $this->rates;
 	}
-	/**
-	 * Инициализируем класс
-	 */
+
 	public function init()
 	{
-		// Если есть общесистемный кэш используем его
-		if (Yii::app()->{$this->cahceId})
+		$this->rates = $this->getCache()->get(self::DATA_CACHE_ID);
+		if(!$this->rates)
 		{
-			$this->setCache(Yii::app()->{$this->cahceId});
-		}
-		else // Иначе создаем внутренний кэш 
-		{
-			$this->setCache(new $this->cacheClass);
-			$this->getCache()->init();
-		}
-		
-		if (!($this->_currencyArray = $this->_cache->get('cbrf_currency')))
-		{
-			if(($result = $this->loadDataFromSource()) === true) 
-			{
-				$this->getCache()->set('cbrf_currency', $this->_currencyArray, 0, new CbrfDateDependency($this->cacheDateString));
-				
-				// Если курс валют не поменялся с предыдущего обновления
-				if ($this->getCache()->get('cbrf_currency_out_of_date') && $this->getCache()->get('cbrf_currency_out_of_date') === $this->getCache()->get('cbrf_currency'))
-				{
-					$this->getCache()->delete('cbrf_currency');
-				}
-				
-				$this->getCache()->set('cbrf_currency_out_of_date', $this->_currencyArray);
-			}
-			else if ($this->generateCbrfOutOfDateException)
-			{
-				throw new CbrfOutOfDateException($result);
-			}
-			else // Извлекаем устаревшие данные 
-			{
-				$this->_currencyArray = $this->getCache()->get('cbrf_currency_out_of_date');
-			}
+			$this->rates = $this->loadRatesFromService();
+			$this->getCache()->set(self::DATA_CACHE_ID, $this->rates, $this->getExpireTime());
 		}
 	}
+
 	/**
-	 * Установить свой класс кэша
-	 * @param $cache
+	 * Return expire cache time to next day.
+	 * 
+	 * @return int
 	 */
-	public function setCache($cache) 
+	protected function getExpireTime()
 	{
-		if (!$cache instanceof ICache) 
-		{
-			throw new CbrfException('Cache must be instance of ICache');
-		}
-		$this->_cache = $cache;
+		return strtotime("tomorrow") - time();
 	}
+
 	/**
-	 * Получить кэш
+	 * Return cache object.
+	 *
+	 *
+	 * @return ICache
 	 */
-	public function getCache()
+	protected function getCache()
 	{
-		return $this->_cache;
-	}
-	/**
-	 * Загрузить данные от источника
-	 * @return mixed true если все успешно, иначе string с сообщением об ошибке
-	 */
-	protected function loadDataFromSource()
-	{
-		$xml = @simplexml_load_file($this->sourceUrl);
-		if (!$xml) return 'Data from sourceUrl is broken';
-		
-		foreach ($xml->{'Valute'} as $valute) 
+		if(!$this->cache)
 		{
-			$value = str_replace(',', '.', $valute->{'Value'}) / $valute->{'Nominal'};
-			$this->_currencyArray[current($valute->{'CharCode'})] = $value;	
+			if($this->cacheId)
+				$this->cache = Yii::app()->getComponent($this->cacheId);
+			if(!($this->cache instanceof ICache))
+				$this->cache = new CDummyCache;
 		}
-		
-		if (empty($this->_currencyArray)) return 'Data from sourceUrl is broken';
-		
-		return true;
+		return $this->cache;
+	}
+
+	/**
+	 * Возвращает данные по валютам с сервиса от источника
+	 *
+	 * @throws CbrfServiceException on error load rated
+	 * @return array вида CharCode => value.
+	 */
+	protected function loadRatesFromService()
+	{
+		// load and check xml doc
+		$xml = $this->loadXml();
+		if(!$xml->{'Valute'})
+			throw new CbrfServiceException('Invalid data from service');
+		// calculate rates
+		$rates = array();
+		foreach($xml->{'Valute'} as $rate)
+		{
+			$value = str_replace(',', '.', $rate->{'Value'}) / $rate->{'Nominal'};
+			$rates[current($rate->{'CharCode'})] = $value;
+		}
+		return $rates;
+	}
+
+	/**
+	 * @throws CbrfServiceException
+	 * @return SimpleXMLElement
+	 */
+	protected function loadXml()
+	{
+		// load xml doc with internal errors
+		libxml_use_internal_errors(true);
+		$xml = simplexml_load_file($this->sourceUrl);
+		$errors = libxml_get_errors();
+		libxml_clear_errors();
+		libxml_use_internal_errors(false);
+		// check for errors
+		if($errors)
+			throw new CbrfServiceException('Invalid xml source: '.join(", ", $errors));
+		return $xml;
 	}
 }
 
-/**
- * Зависиомть кэша от даты в формате date()
- */
-class CbrfDateDependency extends CCacheDependency
-{
-	/**
-	 * Дата для организации зависиости
-	 * @var string
-	 */
-	public $dateString;
-	/**
-	 * Конструктор
-	 * @param string $dateString строка в формате date()
-	 */
-	public function __construct($dateString = 'Ymd')
-	{
-		$this->dateString = $dateString;
-	}
-	/**
-	 * Генерируем зависмость
-	 */
-	protected function generateDependentData()
-	{
-		return date($this->dateString);
-	}
-}
-
-class CbrfException extends CException {}
-class CbrfOutOfDateException extends CbrfException {}
+class CbrfException extends Exception {}
+class CbrfCurrencyException extends CbrfException {}
+class CbrfServiceException extends CbrfException {}
